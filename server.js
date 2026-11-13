@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const admin = require("firebase-admin");
 
 const app = express();
+app.disable("x-powered-by");
 
 const PORT = process.env.PORT || 3000;
 const PUBSCALE_SECRET_KEY = process.env.PUBSCALE_SECRET_KEY;
@@ -35,6 +36,7 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+const FieldValue = admin.firestore.FieldValue;
 
 // --------------------------------------------------
 // FIRESTORE PATHS
@@ -59,36 +61,6 @@ function hashId(value) {
     .createHash("sha256")
     .update(value)
     .digest("hex");
-}
-
-function isValidSignature({
-  userId,
-  integerValue,
-  token,
-  signature,
-}) {
-  if (
-    typeof signature !== "string" ||
-    !/^[a-fA-F0-9]{32}$/.test(signature)
-  ) {
-    return false;
-  }
-
-  const template =
-    `${PUBSCALE_SECRET_KEY}.${userId}.${integerValue}.${token}`;
-
-  const expected = crypto
-    .createHash("md5")
-    .update(template)
-    .digest("hex");
-
-  const expectedBuffer = Buffer.from(expected, "hex");
-  const receivedBuffer = Buffer.from(signature, "hex");
-
-  return (
-    expectedBuffer.length === receivedBuffer.length &&
-    crypto.timingSafeEqual(expectedBuffer, receivedBuffer)
-  );
 }
 
 function parsePositiveValue(value) {
@@ -125,12 +97,67 @@ function parseSignedValue(value) {
   return number;
 }
 
+function isValidSignature({
+  userId,
+  integerValue,
+  token,
+  signature,
+}) {
+  if (
+    typeof signature !== "string" ||
+    !/^[a-fA-F0-9]{32}$/.test(signature)
+  ) {
+    return false;
+  }
+
+  const template =
+    `${PUBSCALE_SECRET_KEY}.${userId}.${integerValue}.${token}`;
+
+  const expected = crypto
+    .createHash("md5")
+    .update(template)
+    .digest("hex");
+
+  const expectedBuffer = Buffer.from(expected, "hex");
+  const receivedBuffer = Buffer.from(signature, "hex");
+
+  return (
+    expectedBuffer.length === receivedBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, receivedBuffer)
+  );
+}
+
+function validateCommonParameters(query) {
+  const { user_id, token, signature } = query;
+
+  if (
+    typeof user_id !== "string" ||
+    typeof token !== "string" ||
+    typeof signature !== "string"
+  ) {
+    return false;
+  }
+
+  if (
+    user_id.length === 0 ||
+    user_id.length > 128 ||
+    token.length === 0 ||
+    token.length > 256
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 // --------------------------------------------------
 // HEALTH CHECK
 // --------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.status(200).send("MyContest PubScale Backend Running");
+  res.status(200).send(
+    "MyContest PubScale Backend Running"
+  );
 });
 
 app.get("/pubscale/health", (req, res) => {
@@ -147,25 +174,19 @@ app.get("/pubscale/health", (req, res) => {
 
 app.get("/pubscale/callback", async (req, res) => {
   try {
-    const { user_id, value, token, signature } = req.query;
+    const {
+      user_id,
+      value,
+      token,
+      signature,
+    } = req.query;
 
-    if (
-      typeof user_id !== "string" ||
-      typeof token !== "string" ||
-      typeof signature !== "string"
-    ) {
-      return res.status(400).send("Missing parameters");
-    }
-
-    if (
-      user_id.length === 0 ||
-      user_id.length > 128 ||
-      token.length === 0 ||
-      token.length > 256
-    ) {
+    // Validate parameters
+    if (!validateCommonParameters(req.query)) {
       return res.status(400).send("Invalid parameters");
     }
 
+    // Validate reward
     const rewardValue = parsePositiveValue(value);
 
     if (rewardValue === null) {
@@ -178,6 +199,7 @@ app.get("/pubscale/callback", async (req, res) => {
       return res.status(400).send("Invalid integer reward");
     }
 
+    // Verify PubScale signature
     const valid = isValidSignature({
       userId: user_id,
       integerValue,
@@ -186,11 +208,11 @@ app.get("/pubscale/callback", async (req, res) => {
     });
 
     if (!valid) {
-      console.error("PubScale reward signature failed");
+      console.error("PubScale reward signature verification failed");
       return res.status(403).send("Invalid signature");
     }
 
-    // Firebase UID must be passed as PubScale unique_id.
+    // Firebase UID must be used as PubScale unique_id.
     const firebaseUid = user_id;
 
     const transactionId = hashId(token);
@@ -201,6 +223,7 @@ app.get("/pubscale/callback", async (req, res) => {
     const userRef = pubscaleUsers
       .doc(firebaseUid);
 
+    // Atomic reward credit and duplicate protection
     const result = await db.runTransaction(async (tx) => {
       const existing = await tx.get(transactionRef);
 
@@ -218,44 +241,58 @@ app.get("/pubscale/callback", async (req, res) => {
         ? Number(userSnapshot.data().total_offers || 0)
         : 0;
 
+      if (
+        !Number.isFinite(previousEarned) ||
+        !Number.isFinite(previousOffers)
+      ) {
+        throw new Error("Invalid existing PubScale user balance");
+      }
+
       tx.set(
         userRef,
         {
           unique_id: firebaseUid,
           total_earned: previousEarned + rewardValue,
           total_offers: previousOffers + 1,
-          updated_at:
-            admin.firestore.FieldValue.serverTimestamp(),
-          last_offer_at:
-            admin.firestore.FieldValue.serverTimestamp(),
+          updated_at: FieldValue.serverTimestamp(),
+          last_offer_at: FieldValue.serverTimestamp(),
         },
         { merge: true }
       );
 
       tx.create(transactionRef, {
         provider: "pubscale",
+        event_type: "reward",
         user_id: firebaseUid,
         token,
         reward_value: rewardValue,
         signature_verified: true,
         status: "credited_to_pubscale_balance",
-        created_at:
-          admin.firestore.FieldValue.serverTimestamp(),
+        created_at: FieldValue.serverTimestamp(),
       });
 
       return "credited";
     });
 
     if (result === "duplicate") {
+      console.log("Duplicate PubScale reward:", transactionId);
       return res.status(200).send("Duplicate transaction");
     }
 
-    console.log("PubScale reward credited:", firebaseUid);
+    console.log(
+      "PubScale reward credited:",
+      firebaseUid,
+      rewardValue
+    );
 
     return res.status(200).send("OK");
 
   } catch (error) {
-    console.error("PubScale reward callback error:", error.message);
+    console.error(
+      "PubScale reward callback error:",
+      error.message
+    );
+
     return res.status(500).send("Internal server error");
   }
 });
@@ -266,25 +303,19 @@ app.get("/pubscale/callback", async (req, res) => {
 
 app.get("/pubscale/chargeback", async (req, res) => {
   try {
-    const { user_id, value, token, signature } = req.query;
+    const {
+      user_id,
+      value,
+      token,
+      signature,
+    } = req.query;
 
-    if (
-      typeof user_id !== "string" ||
-      typeof token !== "string" ||
-      typeof signature !== "string"
-    ) {
-      return res.status(400).send("Missing parameters");
-    }
-
-    if (
-      user_id.length === 0 ||
-      user_id.length > 128 ||
-      token.length === 0 ||
-      token.length > 256
-    ) {
+    // Validate parameters
+    if (!validateCommonParameters(req.query)) {
       return res.status(400).send("Invalid parameters");
     }
 
+    // Chargeback value may be positive or negative.
     const callbackValue = parseSignedValue(value);
 
     if (callbackValue === null) {
@@ -297,6 +328,7 @@ app.get("/pubscale/chargeback", async (req, res) => {
       return res.status(400).send("Invalid integer chargeback value");
     }
 
+    // Verify chargeback signature
     const valid = isValidSignature({
       userId: user_id,
       integerValue,
@@ -305,21 +337,21 @@ app.get("/pubscale/chargeback", async (req, res) => {
     });
 
     if (!valid) {
-      console.error("PubScale chargeback signature failed");
+      console.error("PubScale chargeback signature verification failed");
       return res.status(403).send("Invalid signature");
     }
 
     const firebaseUid = user_id;
     const reversalAmount = Math.abs(callbackValue);
 
-    // Assumption: PubScale sends the ORIGINAL reward token.
+    // IMPORTANT:
+    // This implementation assumes PubScale sends the original
+    // reward token in its chargeback callback.
     const transactionId = hashId(token);
+    const reversalId = hashId(`chargeback:${token}`);
 
     const originalRef = pubscaleTransactions
       .doc(transactionId);
-
-    // Separate idempotency key for the reversal event.
-    const reversalId = hashId(`chargeback:${token}`);
 
     const reversalRef = pubscaleTransactions
       .doc(reversalId);
@@ -328,6 +360,7 @@ app.get("/pubscale/chargeback", async (req, res) => {
       .doc(firebaseUid);
 
     const result = await db.runTransaction(async (tx) => {
+      // All reads happen before writes.
       const reversalSnapshot = await tx.get(reversalRef);
 
       if (reversalSnapshot.exists) {
@@ -352,7 +385,6 @@ app.get("/pubscale/chargeback", async (req, res) => {
 
       const originalAmount = Number(original.reward_value);
 
-      // Do not reverse an amount different from the original credit.
       if (
         !Number.isFinite(originalAmount) ||
         Math.abs(originalAmount - reversalAmount) > 0.000001
@@ -366,29 +398,32 @@ app.get("/pubscale/chargeback", async (req, res) => {
         return "user_not_found";
       }
 
-      const currentEarned = Number(
-        userSnapshot.data().total_earned || 0
-      );
+      const userData = userSnapshot.data();
 
-      const currentReversed = Number(
-        userSnapshot.data().total_reversed || 0
-      );
+      const currentEarned = Number(userData.total_earned || 0);
+      const currentReversed = Number(userData.total_reversed || 0);
 
-      // A reversal may make the separate balance negative.
-      // This preserves the full reversal amount.
+      if (
+        !Number.isFinite(currentEarned) ||
+        !Number.isFinite(currentReversed)
+      ) {
+        throw new Error("Invalid PubScale user balance");
+      }
+
+      // Reverse only the separate PubScale balance.
       tx.update(userRef, {
         total_earned: currentEarned - reversalAmount,
         total_reversed: currentReversed + reversalAmount,
-        updated_at:
-          admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
       });
 
+      // Mark original transaction as reversed.
       tx.update(originalRef, {
         status: "reversed",
-        reversed_at:
-          admin.firestore.FieldValue.serverTimestamp(),
+        reversed_at: FieldValue.serverTimestamp(),
       });
 
+      // Save separate chargeback history.
       tx.create(reversalRef, {
         provider: "pubscale",
         event_type: "chargeback",
@@ -398,8 +433,7 @@ app.get("/pubscale/chargeback", async (req, res) => {
         signature_verified: true,
         status: "reversed_from_pubscale_balance",
         original_transaction_id: transactionId,
-        created_at:
-          admin.firestore.FieldValue.serverTimestamp(),
+        created_at: FieldValue.serverTimestamp(),
       });
 
       return "reversed";
@@ -426,15 +460,23 @@ app.get("/pubscale/chargeback", async (req, res) => {
     }
 
     if (result === "user_not_found") {
-      return res.status(404).send("User balance not found");
+      return res.status(404).send("PubScale user not found");
     }
 
-    console.log("PubScale chargeback processed:", firebaseUid);
+    console.log(
+      "PubScale chargeback processed:",
+      firebaseUid,
+      reversalAmount
+    );
 
     return res.status(200).send("OK");
 
   } catch (error) {
-    console.error("PubScale chargeback error:", error.message);
+    console.error(
+      "PubScale chargeback error:",
+      error.message
+    );
+
     return res.status(500).send("Internal server error");
   }
 });
