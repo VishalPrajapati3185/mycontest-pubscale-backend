@@ -1,1 +1,16 @@
-
+{
+  "name": "mycontest-pubscale-backend",
+  "version": "1.0.0",
+  "description": "MyContest PubScale S2S Reward Callback Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
